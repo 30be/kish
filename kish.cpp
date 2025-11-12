@@ -1,49 +1,84 @@
+// TODO LIST:
+// - Make multiple threads to be able to export history while you wait
+// - Add Ctrl-C to stop the process
+// - Add some marker to see that the model even works/thinks
+// - Parse the thoughts to send them in the js separately
+// - Quite a bit of prompt engineering
+
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <format>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <numeric>
 #include <poll.h>
 #include <pty.h>
 #include <pwd.h>
+#include <span>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <sys/wait.h>
 #include <termios.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
-// TODO LIST:
-// Make 200 lines from the current 400+
-// Check the $-code for 1) that it does not start with rm and 2) it compiles
-// - use some bash linter for that
-// Fix the editor in KI|asdasd|SH - it is able to edit the entire screen now
-// Add the quote screening for sending queries containing them
-// Nvim history contains a lot of bs if open nvim
-// Handle API errors(rate limits) graciously
-// Make multiple threads to be able to export history while you wait
-// Add Ctrl-C to stop the process
-// Add some marker to see that the model even works/thinks
+using namespace std::literals;
+namespace fs = std::filesystem;
+
+struct log {
+  template <class T> log operator<<(const std::span<T> span) {
+    std::ofstream l("/tmp/kish_log", std::ios::app);
+    l << "span{size=" << span.size() << ",data=[";
+    for (auto &el : span)
+      if (isprint(el))
+        l << el;
+      else
+        l << "(" << int(el) << ")";
+    l << "]}";
+    return *this;
+  }
+  template <class T> log &operator<<(const T &val) {
+    std::ofstream("/tmp/kish_log", std::ios::app) << val;
+    return *this;
+  }
+} log;
 
 std::string homedir;
+std::vector<std::string> history;
+std::string current_input;
+bool kish_mode = false;
+int master_fd;
+
+int CTRL_H = 8;
+int CTRL_X = 24;
+char ESC = '\x1b';
+char BEL = 7;
+int DELETE = 127;
+int BACKSPACE = 8;
+int CARRIAGE_RETURN = 13;
+int API_RETRIES = 5;
+const std::string ALTERNATE_SCREEN_SEQUENCE = "\x1b[?1049h";
+const std::string ALTERNATE_SCREEN_RETURN_SEQUENCE = "\x1b[?1049l";
+
 void load_env() {
   char *c = getenv("HOME");
   homedir = c ? c : std::string(getpwuid(getuid())->pw_dir);
 
   std::string env_path = homedir + "/.env";
   std::ifstream env_file(env_path);
-  if (!env_file) {
+  if (!env_file)
     return; // .env file not found, not an error
-  }
 
   std::string line;
   while (std::getline(env_file, line)) {
-    if (line.empty() || line[0] == '#') {
+    if (line.empty() || line[0] == '#')
       continue;
-    }
     size_t pos = line.find('=');
     if (pos != std::string::npos) {
       std::string key = line.substr(0, pos);
@@ -53,96 +88,23 @@ void load_env() {
   }
 }
 
-std::string escape_json_string(std::string_view s) {
-  std::string res;
-  res.reserve(s.length());
-  for (char c : s) {
+std::string escape_json(const std::string &s) {
+  auto get_escaped_char = [](auto c) -> std::string {
     switch (c) {
-    case '"':
-      res += "\\\"";
-      break;
-    case '\\':
-      res += "\\\\";
-      break;
-    case '\b':
-      res += "\\b";
-      break;
-    case '\f':
-      res += "\\f";
-      break;
-    case '\n':
-      res += "\\n";
-      break;
-    case '\r':
-      res += "\\r";
-      break;
-    case '\t':
-      res += "\\t";
-      break;
-    default:
-      res += c;
-      break;
+    case '"': return "\\\"";
+    case '\\': return "\\\\";
+    case '\b': return "\\b";
+    case '\f': return "\\f";
+    case '\n': return "\\n";
+    case '\r': return "\\r";
+    case '\t': return "\\t";
+    default: return {c};
     }
-  }
-  return res;
+  };
+  return std::accumulate(
+      s.begin(), s.end(), std::string(),
+      [&](std::string res, char c) { return res + get_escaped_char(c); });
 }
-
-std::string strip_ansi(std::string_view input) {
-  std::string output;
-  output.reserve(input.size());
-  size_t i = 0;
-  while (i < input.size()) {
-    if (input[i] == '\x1b') {
-      i++;
-      if (i >= input.size())
-        break;
-
-      if (input[i] == '[') { // CSI
-        i++;
-        // Parameters
-        while (i < input.size() && input[i] >= 0x30 && input[i] <= 0x3F) {
-          i++;
-        }
-        // Intermediate bytes
-        while (i < input.size() && input[i] >= 0x20 && input[i] <= 0x2F) {
-          i++;
-        }
-        // Final byte
-        if (i < input.size() && input[i] >= 0x40 && input[i] <= 0x7E) {
-          i++;
-        }
-      } else if (input[i] == ']') { // OSC
-        i++;
-        // Terminated by BEL (0x07) or ST (ESC \)
-        size_t end = input.find('\x07', i);
-        if (end != std::string_view::npos) {
-          i = end + 1;
-        } else {
-          end = input.find("\x1b\\", i);
-          if (end != std::string_view::npos) {
-            i = end + 2;
-          } else {
-            // Not terminated, assume it runs to the end of the buffer.
-            i = input.size();
-          }
-        }
-      } else {
-        // Other 2-char escape sequences.
-        i++;
-      }
-    } else {
-      if (isprint(static_cast<unsigned char>(input[i])) || input[i] == '\n' ||
-          input[i] == '\r' || input[i] == '\t') {
-        output += input[i];
-      }
-      i++;
-    }
-  }
-  return output;
-}
-
-#include <cstdio>
-#include <vector>
 
 // Function to execute a command and return its output
 std::string exec(const char *cmd) {
@@ -158,8 +120,38 @@ std::string exec(const char *cmd) {
   return result;
 }
 
-void send_prompt(int master_fd, std::vector<std::string> &history) {
-  // write(master_fd, "\n", 1);
+std::string cleanup_history(std::string history) {
+  std::string res;
+  for (int i = 0; i < history.length(); i++)
+    if (ALTERNATE_SCREEN_SEQUENCE ==
+        history.substr(i, ALTERNATE_SCREEN_RETURN_SEQUENCE.length())) {
+      while (history.substr(i, ALTERNATE_SCREEN_RETURN_SEQUENCE.length()) !=
+             ALTERNATE_SCREEN_RETURN_SEQUENCE)
+        i++;
+      i += ALTERNATE_SCREEN_RETURN_SEQUENCE.length() - 1;
+    } else if (history[i] == ESC && i < history.length() - 1 &&
+               history[i + 1] == '[') {
+      while (!isalpha(history[i]))
+        i++;
+    } else if (history[i] == ESC && i < history.length() - 1 &&
+               history[i + 1] == ']')
+      while (history[i] != BEL) {
+        if (history[i] == ESC && i < history.length() - 1 &&
+            history[i + 1] == '\\') {
+          i++;
+          break;
+        }
+        i++;
+      }
+    else if (history[i] == BACKSPACE)
+      res.pop_back();
+    else if (history[i] == CARRIAGE_RETURN)
+      ;
+    else
+      res += history[i];
+  return res;
+}
+std::optional<std::pair<std::string, std::string>> get_response() {
   std::string kishrc_path = homedir + "/.kishrc";
   std::string history_path = homedir + "/.kish_history";
 
@@ -168,13 +160,11 @@ void send_prompt(int master_fd, std::vector<std::string> &history) {
                      std::istreambuf_iterator<char>());
   if (kishrc.empty()) {
     std::cerr << "\nNo kishrc found. Please create ~/.kishrc" << std::endl;
-    return;
+    return {};
   }
   std::string prompt =
       std::accumulate(history.begin() + 1, history.end(), history[0]);
-
-  std::string escaped_kishrc = escape_json_string(kishrc);
-  std::string escaped_prompt = escape_json_string(prompt);
+  prompt = cleanup_history(prompt);
 
   std::ofstream(history_path) << prompt;
 
@@ -184,111 +174,182 @@ void send_prompt(int master_fd, std::vector<std::string> &history) {
         << "\nError: MOONSHOT_API_KEY environment variable not set. You can "
            "write it like MOONSHOT_API_KEY=sk-... in your ~/.env file."
         << std::endl;
-    return;
+    return {};
   }
-  std::string kimi_api_key = api_key_cstr;
 
-  std::string json_payload = R"({
+  std::string json_payload =
+      std::format(R"({{
     "model": "kimi-k2-thinking-turbo",
     "messages": [
-        {"role": "system", "content": ")" +
-                             escaped_kishrc + R"("},
-        {"role": "user", "content": ")" +
-                             escaped_prompt + R"("}
+        {{"role": "system", "content": "{}"}},
+        {{"role": "user", "content": "{}"}}
     ],
     "temperature": 0.5
-  })";
-
-  // Write JSON payload to a temporary file to avoid shell injection
+}})",
+                  escape_json(kishrc), escape_json(prompt));
   std::string payload_temp_file_path = "/tmp/kish_payload.json";
-  std::ofstream payload_temp_file(payload_temp_file_path);
-  if (!payload_temp_file) {
-    std::cerr << "\nError: Could not create temporary file for JSON payload."
-              << std::flush;
-    return;
-  }
-  payload_temp_file << json_payload;
-  payload_temp_file.close();
+  std::ofstream(payload_temp_file_path) << json_payload;
 
   std::string command_base =
-      "curl -s https://api.moonshot.ai/v1/chat/completions "
-      "-H \"Content-Type: application/json\" "
-      "-H \"Authorization: Bearer " +
-      kimi_api_key +
-      "\" "
-      "-d @" +
-      payload_temp_file_path + " 2>&1";
-
+      std::format("curl -s https://api.moonshot.ai/v1/chat/completions "
+                  "-H \"Content-Type: application/json\" "
+                  "-H \"Authorization: Bearer {}\" "
+                  "-d @{} 2>&1",
+                  api_key_cstr, payload_temp_file_path);
   try {
-    // std::cout << "Sending" << command_base;
-    std::string raw_response = exec(command_base.c_str());
-    // std::cout << "Received" << raw_response;
+    for (int i = 0; i < API_RETRIES; i++) {
+      std::string raw_response = exec(command_base.c_str());
+      std::string temp_file_path = "/tmp/kish_response.json";
+      std::ofstream(temp_file_path) << raw_response;
 
-    // Write response to a temporary file to avoid shell injection
-    std::string temp_file_path = "/tmp/kish_response.json";
-    std::ofstream temp_file(temp_file_path);
-    if (!temp_file) {
-      std::cerr << "\nError: Could not create temporary file for response."
-                << std::flush;
-      remove(payload_temp_file_path.c_str()); // Clean up payload file
-      return;
-    }
-    temp_file << raw_response;
-    temp_file.close();
+      std::string error_check_command =
+          "jq -r 'if .error then .error.message else \"\" end' " +
+          temp_file_path;
+      std::string api_error = exec(error_check_command.c_str());
 
-    // Check for top-level API errors first
-    std::string error_check_command =
-        "jq -r 'if .error then .error.message else \"\" end' " + temp_file_path;
-    std::string api_error = exec(error_check_command.c_str());
-
-    if (!api_error.empty() && api_error != "null\n" &&
-        !api_error.starts_with("\n")) {
-      std::cerr << "\nAPI Error: " << api_error << std::flush;
-      history.push_back("API Error: " + api_error);
-      remove(temp_file_path.c_str());         // Clean up response file
-      remove(payload_temp_file_path.c_str()); // Clean up payload file
-      return;
-    }
-
-    // Extract content
-    std::string content_command =
-        "jq -r '.choices[0].message.content' " + temp_file_path;
-    std::string content = exec(content_command.c_str());
-
-    // Extract reasoning content
-    std::string reasoning_command =
-        "jq -r '.choices[0].message.reasoning_content' " + temp_file_path;
-    std::string reasoning_content = exec(reasoning_command.c_str());
-
-    // Clean up the temporary files
-    remove(temp_file_path.c_str());
-    remove(payload_temp_file_path.c_str());
-
-    if (!content.empty() && content != "null\n") {
-      if (content.starts_with("$ ")) {
-        std::string command_to_run = content.substr(2);
-        // The model might add a newline, let's strip it.
-        if (!command_to_run.empty() && command_to_run.back() == '\n') {
-          command_to_run.pop_back();
-        }
-        history.push_back(command_to_run);
-        std::string exec_str = command_to_run + "\nKISH_CMD_DONE";
-        write(master_fd, exec_str.c_str(), exec_str.length());
-      } else {
-        std::cout << "\n" << content << std::flush;
-
-        write(master_fd, "\n", 1);
-        history.push_back(content);
+      if (!api_error.empty() && api_error != "\n") {
+        std::cerr << "\nAPI Error: " << api_error << "\nRetrying..."
+                  << std::flush;
+        history.push_back("API Error: " + api_error + "\nRetrying...");
+        std::this_thread::sleep_for(5s);
+        continue; // GOTO while(true)
       }
-    } else {
-      std::cerr << "\nCould not parse AI response content: " << raw_response
-                << std::flush;
-      history.push_back("Could not parse AI response content: " + raw_response);
-    }
-    history.push_back("\n<thoughts>\n" + reasoning_content + "\n</thoughts>\n");
 
+      std::string content_command =
+          "jq -r '.choices[0].message.content' " + temp_file_path;
+      std::string content = exec(content_command.c_str());
+
+      std::string reasoning_command =
+          "jq -r '.choices[0].message.reasoning_content' " + temp_file_path;
+      std::string reasoning_content = exec(reasoning_command.c_str());
+
+      fs::remove(temp_file_path);
+      fs::remove(payload_temp_file_path);
+      if (content.empty()) {
+        std::cerr << "\nCouldn't parse response:" << raw_response << std::flush;
+        history.push_back("Could not parse AI response content: " +
+                          raw_response);
+        return {};
+      }
+      return {{content, reasoning_content}};
+    }
+    return {};
   } catch (const std::runtime_error &e) {
     std::cerr << "\nError executing curl/jq: " << e.what() << std::flush;
+    return {};
+  }
+}
+void send_prompt() {
+  auto response = get_response();
+  if (!response)
+    return;
+
+  auto [content, reasoning_content] = *response;
+
+  if (content.starts_with("$ ")) {
+    std::string command_to_run = content.substr(2);
+    if (!command_to_run.empty() && command_to_run.back() == '\n')
+      command_to_run.pop_back();
+    auto err = exec(("bash -nc " + command_to_run).c_str());
+    history.push_back(command_to_run);
+    std::string exec_str = command_to_run + "\nKISH_CMD_DONE";
+    if (!err.empty())
+      history.push_back(err);
+    else
+      write(master_fd, exec_str.c_str(), exec_str.length());
+  } else {
+    std::cout << content << std::flush;
+    write(master_fd, "\n\n", 1);
+    history.push_back(content);
+  }
+  history.push_back("\n<thoughts>\n" + reasoning_content + "\n</thoughts>\n");
+}
+
+void save_history() {
+  std::string prompt =
+      std::accumulate(history.begin() + 1, history.end(), history[0]);
+  prompt = cleanup_history(prompt);
+  std::ofstream(homedir + "/kish_history.txt") << prompt;
+  std::cout << "\nHistory exported to ~/kish_history.txt" << std::flush;
+}
+
+void read_keyboard(std::span<char> data) {
+  log << data;
+  if (data.empty())
+    return;
+  char c = data[0];
+  if (c == CTRL_X) {
+    log << "Ctrl-X detected\n";
+    kish_mode = !kish_mode;
+    if (kish_mode) {
+      std::cout << "KI|" << std::flush;
+    } else {
+      std::cout << "|SH" << std::endl;
+      history.push_back("KI|" + current_input + "|SH");
+      send_prompt();
+      current_input.clear();
+    }
+  } else if (c == CTRL_H) {
+    log << "Ctrl-H detected\n";
+    save_history();
+  } else if (kish_mode) {
+    if (c == '\r' || c == '\n') {
+      history.push_back(current_input);
+      current_input.clear();
+      std::cout << "\nKI|" << std::flush;
+    } else if (c == DELETE) {
+      if (!current_input.empty()) {
+        current_input.pop_back();
+        std::cout << "\b \b" << std::flush;
+      }
+    } else if (std::isprint(c)) {
+      current_input += c;
+      std::cout << c << std::flush;
+    } // Just ignore everything else(arrows not supported)
+  } else {
+    write(master_fd, data.data(), data.size());
+    return;
+  }
+  read_keyboard(data.subspan(1));
+}
+
+void read_terminal(std::span<char> data) {
+  std::string shell_output(data.begin(), data.end());
+  size_t marker_pos = shell_output.find("KISH_CMD_DONE");
+  if (marker_pos != std::string::npos) {
+    // Command finished, process output before marker
+    std::string command_output = shell_output.substr(0, marker_pos);
+    write(STDOUT_FILENO, command_output.c_str(), command_output.length());
+    history.push_back(command_output);
+    send_prompt();
+    // Any remaining output after marker (e.g., new prompt) will be
+    // handled in next poll
+  } else {
+    log << "Got shell_output, writing:" << data << "\n";
+    write(STDOUT_FILENO, data.data(), data.size());
+    history.push_back({data.begin(), data.end()});
+  }
+}
+
+void run() {
+  while (true) {
+    struct pollfd fds[] = {{STDIN_FILENO, POLLIN, 0}, {master_fd, POLLIN, 0}};
+    int ret = poll(fds, 2, -1);
+    if (ret < 0) {
+      std::cerr << "poll: " << strerror(errno) << std::endl;
+      break;
+    }
+
+    for (int fd : {0, 1})
+      if (fds[fd].revents & POLLIN) {
+        std::array<char, 1024> buffer;
+        ssize_t count = read(fds[fd].fd, buffer.data(), buffer.size());
+        if (count <= 0)
+          break;
+        std::array<std::function<void(std::span<char>)>, 2>{read_keyboard,
+                                                            read_terminal}[fd](
+            std::span<char>(buffer.data(), static_cast<size_t>(count)));
+      }
   }
 }
 
@@ -301,7 +362,6 @@ int main() {
   raw.c_lflag &= ~(ECHO | ICANON);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 
-  int master_fd;
   pid_t pid = forkpty(&master_fd, NULL, NULL, NULL);
 
   if (pid < 0) {
@@ -309,106 +369,12 @@ int main() {
     return 1;
   } else if (pid == 0) {
     execlp("/bin/bash", "/bin/bash", NULL);
-    exit(1);
-  } else {
-    // Parent process
-    std::vector<std::string> history;
-    std::string current_input;
-    bool kish_mode = false;
-
-    while (true) {
-      struct pollfd fds[2];
-      fds[0].fd = STDIN_FILENO;
-      fds[0].events = POLLIN;
-      fds[1].fd = master_fd;
-      fds[1].events = POLLIN;
-
-      int ret = poll(fds, 2, -1);
-      if (ret < 0) {
-        std::cerr << "poll: " << strerror(errno) << std::endl;
-        break;
-      }
-
-      if (fds[0].revents & POLLIN) {
-        char c;
-        if (read(STDIN_FILENO, &c, 1) <= 0)
-          break;
-
-        if (c == 24) { // Ctrl+X
-          kish_mode = !kish_mode;
-          if (kish_mode) {
-            std::cout << "KI|" << std::flush;
-          } else {
-            std::cout << "|SH" << std::flush;
-            history.push_back("KI|" + current_input + "|SH");
-            send_prompt(master_fd, history);
-            current_input.clear();
-          }
-          continue;
-        } else if (c == 8) { // Ctrl+H
-          std::ofstream output_history_file(homedir + "/kish_history.txt");
-          if (output_history_file.is_open()) {
-            for (const auto &entry : history) {
-              output_history_file << entry << "\n";
-            }
-            output_history_file.close();
-            std::cout << "\nHistory exported to ~/kish_history.txt"
-                      << std::flush;
-          } else {
-            std::cerr << "\nError: Could not open ~/history.txt for writing."
-                      << std::flush;
-          }
-          continue;
-        }
-
-        if (kish_mode) {
-          if (c == '\r' || c == '\n') {
-            history.push_back(current_input);
-            current_input.clear();
-            std::cout << "\nKI|" << std::flush;
-          } else if (c == 127) { // Backspace
-            if (!current_input.empty()) {
-              current_input.pop_back();
-              std::cout << "\b \b" << std::flush;
-            }
-          } else {
-            current_input += c;
-            std::cout << c << std::flush;
-          }
-        } else {
-          write(master_fd, &c, 1);
-        }
-      }
-
-      if (fds[1].revents & POLLIN) {
-        std::array<char, 1024> buffer;
-        ssize_t count = read(master_fd, buffer.data(), buffer.size());
-        if (count <= 0)
-          break;
-
-        std::string shell_output(buffer.data(), count);
-        size_t marker_pos = shell_output.find("KISH_CMD_DONE");
-        if (marker_pos != std::string::npos) {
-          // Command finished, process output before marker
-          std::string command_output = shell_output.substr(0, marker_pos);
-          write(STDOUT_FILENO, command_output.c_str(), command_output.length());
-          history.push_back(strip_ansi(command_output));
-          send_prompt(master_fd, history);
-          // Any remaining output after marker (e.g., new prompt) will be
-          // handled in next poll
-        } else {
-          write(STDOUT_FILENO, buffer.data(), count);
-
-          history.push_back(
-              strip_ansi({buffer.data(), static_cast<size_t>(count)}));
-        }
-      }
-    }
-
-    // Restore terminal settings
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-    waitpid(pid, NULL, 0);
+    return 1;
   }
+  run();
+  // Restore terminal settings
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+  waitpid(pid, NULL, 0);
 
   return 0;
 }
