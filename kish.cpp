@@ -17,12 +17,16 @@
 #include <vector>
 
 // TODO LIST:
-// 1. Make 200 lines from the current 400+
-// 2. Check the $-code for 1) that it does not start with rm and 2) it compiles
+// Make 200 lines from the current 400+
+// Check the $-code for 1) that it does not start with rm and 2) it compiles
 // - use some bash linter for that
-// 3. Fix the editor in KI|asdasd|SH - it is able to edit the entire screen now
+// Fix the editor in KI|asdasd|SH - it is able to edit the entire screen now
 // Add the quote screening for sending queries containing them
 // Nvim history contains a lot of bs if open nvim
+// Handle API errors(rate limits) graciously
+// Make multiple threads to be able to export history while you wait
+// Add Ctrl-C to stop the process
+// Add some marker to see that the model even works/thinks
 
 std::string homedir;
 void load_env() {
